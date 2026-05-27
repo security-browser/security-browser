@@ -145,12 +145,12 @@ class CamoufoxWorker(QtCore.QThread):
 
             self.page = page
 
-            # Show a start page with profile name for easy identification
             colors = ["#4c6ef5", "#2f9e44", "#e8590c", "#862e9c", "#1971c2", "#c2255c"]
             color = colors[hash(self.profile.name) % len(colors)]
-            start_html = f"""data:text/html,<!DOCTYPE html>
+            start_html = f"""<!DOCTYPE html>
 <html><head><title>{self.profile.name}</title>
-<style>body{{margin:0;background:#1a1a2e;display:flex;align-items:center;
+<style>
+body{{margin:0;background:#1a1a2e;display:flex;align-items:center;
 justify-content:center;height:100vh;font-family:system-ui,sans-serif;}}
 .badge{{background:{color};color:#fff;padding:24px 48px;border-radius:16px;
 font-size:32px;font-weight:700;letter-spacing:2px;box-shadow:0 8px 32px rgba(0,0,0,.4);}}
@@ -160,7 +160,7 @@ font-size:32px;font-weight:700;letter-spacing:2px;box-shadow:0 8px 32px rgba(0,0
 <div class="hint">在地址栏输入网址开始浏览</div>
 </body></html>"""
             try:
-                page.goto(start_html)
+                page.set_content(start_html)
             except Exception:
                 pass
 
