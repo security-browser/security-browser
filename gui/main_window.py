@@ -104,9 +104,11 @@ class CamoufoxWorker(QtCore.QThread):
     def __init__(self, profile: Profile, launch_size: Optional[tuple[int,int]]=None, parent=None):
         super().__init__(parent)
         self.profile = profile
-        self.launch_size = launch_size  # (W,H) computed from fullscreen or viewport
+        self.launch_size = launch_size
         self._stop = False
         self._ctx = None
+        self.page = None
+        self._nav_url: Optional[str] = None
 
     def run(self):
         if not CAMOUFOX_OK:
@@ -132,7 +134,6 @@ class CamoufoxWorker(QtCore.QThread):
 
             self._ctx = Camoufox(**opts).__enter__()
 
-            # Reuse existing page if present; close extras
             pages = list(getattr(self._ctx, "pages", []))
             if pages:
                 page = pages[0]
@@ -141,6 +142,8 @@ class CamoufoxWorker(QtCore.QThread):
                     except Exception: pass
             else:
                 page = self._ctx.new_page()
+
+            self.page = page
 
             # Set viewport; if fullscreen, try to match W,H (already set above)
             try:
@@ -157,6 +160,13 @@ class CamoufoxWorker(QtCore.QThread):
 
             self.started_ok.emit(f"Session started for '{self.profile.name}'.")
             while not self._stop:
+                if self._nav_url:
+                    url = self._nav_url
+                    self._nav_url = None
+                    try:
+                        self.page.goto(url)
+                    except Exception:
+                        pass
                 time.sleep(0.2)
 
         except Exception as e:
@@ -175,6 +185,9 @@ class CamoufoxWorker(QtCore.QThread):
 
     def request_stop(self):
         self._stop = True
+
+    def navigate(self, url: str):
+        self._nav_url = url
 
 
 # ===== MainWindow Controller =====
@@ -199,6 +212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.storageEdit: QtWidgets.QLineEdit
         self.browseStorageButton: QtWidgets.QPushButton
         self.saveButton: QtWidgets.QPushButton
+        self.fingerprintButton: QtWidgets.QPushButton
         self.launchButton: QtWidgets.QPushButton
         self.stopButton: QtWidgets.QPushButton
 
@@ -213,11 +227,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.deleteProfileButton.clicked.connect(self._delete_profile)
         self.saveButton.clicked.connect(self._save_changes)
         self.browseStorageButton.clicked.connect(self._browse_storage)
+        self.fingerprintButton.clicked.connect(self._check_fingerprint)
         self.launchButton.clicked.connect(self._launch)
         self.stopButton.clicked.connect(self._stop)
 
         self.launchButton.setObjectName("primary")
         self.stopButton.setObjectName("danger")
+        self.fingerprintButton.setObjectName("info")
 
         # Initial UI state
         self._refresh_list()
@@ -262,9 +278,11 @@ class MainWindow(QtWidgets.QMainWindow):
             running = prof.name in self.workers
             self.launchButton.setEnabled(not running)
             self.stopButton.setEnabled(running)
+            self.fingerprintButton.setEnabled(running)
         else:
             self.launchButton.setEnabled(False)
             self.stopButton.setEnabled(False)
+            self.fingerprintButton.setEnabled(False)
 
     def _current(self) -> Optional[Profile]:
         if 0 <= self.current_index < len(self.profiles):
@@ -353,6 +371,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_list()
         self.profileList.setCurrentRow(self.current_index)
         self.statusbar.showMessage("Profile saved", 3000)
+
+    def _check_fingerprint(self):
+        prof = self._current()
+        if not prof:
+            return
+        worker = self.workers.get(prof.name)
+        if not worker:
+            QtWidgets.QMessageBox.information(self, "未运行", f"请先启动 '{prof.name}' 的 Session。")
+            return
+        worker.navigate("https://browserleaks.com/canvas")
+        self.statusbar.showMessage(f"正在打开指纹检测页面: {prof.name}", 4000)
 
     def _browse_storage(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Storage Directory")

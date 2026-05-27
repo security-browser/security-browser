@@ -392,6 +392,19 @@
          </spacer>
         </item>
         <item>
+         <widget class="QPushButton" name="fingerprintButton">
+          <property name="minimumSize">
+           <size>
+            <width>0</width>
+            <height>34</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>Check Fingerprint</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QPushButton" name="launchButton">
           <property name="minimumSize">
            <size>
