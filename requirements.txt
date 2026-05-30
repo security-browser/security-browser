@@ -2,5 +2,9 @@
 camoufox[geoip]==0.4.11
 PyQt5==5.15.11
 
+# 锁定 playwright<=1.58.0，1.60.0 存在 Firefox pageError.location 空指针崩溃
+# 详见：https://github.com/daijro/camoufox/issues/617
+playwright==1.58.0
+
 # camoufox 间接依赖（由 pip 自动安装，无需手动指定）
 # 浏览器内核版本见：https://github.com/daijro/camoufox/releases/tag/v135.0.1-beta.24
