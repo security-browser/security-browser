@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import sys
 import time
 from dataclasses import dataclass, asdict, field
@@ -109,6 +110,16 @@ class CamoufoxWorker(QtCore.QThread):
         self._ctx = None
         self.page = None
         self._nav_url: Optional[str] = None
+        # ── Gemini automation engine integration ──
+        self._jobs: "queue.Queue" = queue.Queue()
+        self.state: str = "starting"          # starting | idle | busy
+        self.ready: bool = False              # True once the page is usable
+        self.gemini_slot: int = 0             # Google account slot (/u/N)
+        self.media_dir: str = "/tmp/gemini_media"
+
+    def submit_job(self, job):
+        """Enqueue an automation job; it runs on this worker's own thread."""
+        self._jobs.put(job)
 
     def run(self):
         if not CAMOUFOX_OK:
@@ -177,7 +188,11 @@ font-size:32px;font-weight:700;letter-spacing:2px;box-shadow:0 8px 32px rgba(0,0
                 except Exception:
                     pass
 
+            self.ready = True
+            self.state = "idle"
             self.started_ok.emit(f"Session started for '{self.profile.name}'.")
+
+            import automation  # imported here so the page is used on this thread only
             while not self._stop:
                 if self._nav_url:
                     url = self._nav_url
@@ -186,7 +201,20 @@ font-size:32px;font-weight:700;letter-spacing:2px;box-shadow:0 8px 32px rgba(0,0
                         self.page.goto(url)
                     except Exception:
                         pass
-                time.sleep(0.2)
+                try:
+                    job = self._jobs.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.2)
+                    continue
+                self.state = "busy"
+                try:
+                    automation.run_job(self.page, job, self.media_dir,
+                                       slot=self.gemini_slot)
+                except Exception as e:
+                    job.status = "failed"
+                    job.error = f"{type(e).__name__}: {e}"
+                finally:
+                    self.state = "idle"
 
         except Exception as e:
             self.error.emit(f"Failed to start Camoufox: {e}")
@@ -211,6 +239,10 @@ font-size:32px;font-weight:700;letter-spacing:2px;box-shadow:0 8px 32px rgba(0,0
 
 # ===== MainWindow Controller =====
 class MainWindow(QtWidgets.QMainWindow):
+    # Emitted (possibly from the engine thread) to launch a profile by name on
+    # the GUI thread. Cross-thread emit → queued connection automatically.
+    request_launch = QtCore.pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         uic.loadUi("camoufox_manager.ui", self)
@@ -264,6 +296,20 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.setStyle("Fusion")
         self._apply_palette()
         self.statusbar.showMessage("Ready")
+
+        # ── Gemini automation engine + job HTTP API ──
+        self.request_launch.connect(self._launch_by_name)
+        self.engine = None
+        try:
+            from gemini_engine import GeminiEngine
+            from gemini_api import start_api_server
+            self.engine = GeminiEngine(self)
+            self._api_server = start_api_server(self.engine)
+            self.statusbar.showMessage(
+                f"Ready · Gemini engine up (pool={len(self.engine.pool)}) "
+                f"API :{self._api_server.server_address[1]}", 8000)
+        except Exception as e:
+            print(f"[MainWindow] Gemini engine failed to start: {e}")
 
     # ----- Styling
     def _apply_palette(self):
@@ -420,11 +466,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.profiles[self.current_index] = prof
         save_profiles(self.profiles)
 
+        if not self._start_worker(prof):
+            return
+        self._refresh_list()
+        self.profileList.setCurrentRow(self.current_index)
+        self._update_buttons()
+
+    def _find_profile(self, name: str) -> Optional[Profile]:
+        for p in self.profiles:
+            if p.name == name:
+                return p
+        return None
+
+    def _start_worker(self, prof: Profile) -> bool:
+        """Create + start a CamoufoxWorker for `prof`. Returns False on failure.
+        Shared by the Launch button and the engine's request_launch signal."""
+        if prof.name in self.workers:
+            return True
         if not CAMOUFOX_OK:
             QtWidgets.QMessageBox.warning(self, "Camoufox not available",
                                           "Install with:\n  pip install -U 'camoufox[geoip]'\nThen run:\n  camoufox fetch")
-            return
-
+            return False
         if prof.fullscreen:
             screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
             launch_size = (screen.width(), screen.height())
@@ -437,9 +499,17 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.stopped.connect(self._on_stopped)
         self.workers[prof.name] = worker
         worker.start()
-        self._refresh_list()
-        self.profileList.setCurrentRow(self.current_index)
-        self._update_buttons()
+        return True
+
+    def _launch_by_name(self, name: str):
+        """GUI-thread slot: launch a pool profile requested by the engine."""
+        prof = self._find_profile(name)
+        if not prof:
+            self.statusbar.showMessage(f"Engine requested unknown profile '{name}'", 4000)
+            return
+        if self._start_worker(prof):
+            self._refresh_list()
+            self._update_buttons()
 
     def _stop(self):
         prof = self._current()

@@ -4,4 +4,6 @@ __pycache__/
 *.pyo
 gui/profiles/
 gui/profiles.json
+gui/gemini_pool.json
+nohup.out
 *.core
