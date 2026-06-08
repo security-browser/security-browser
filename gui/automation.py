@@ -24,6 +24,7 @@ import tempfile
 import time
 
 import gemini_selectors as S
+import watermark
 
 # Minimum natural dimension (px) for an image to count as a real generated
 # result — filters out avatars, sidebar thumbnails, and loading placeholders
@@ -483,15 +484,26 @@ def run_job(page, job, media_dir, slot=0, log=print):
             return
 
         results = []
+        is_video = job.type == "video"
         for raw, media_type in items:
+            # Strip the visible ✦ logo (keeps SynthID). Images: in-memory before
+            # hashing so filename/b64 reflect the cleaned bytes.
+            if watermark.STRIP and not is_video and "image" in media_type:
+                cleaned = watermark.strip_image_watermark(raw)
+                if cleaned and cleaned is not raw:
+                    raw, media_type = cleaned, "image/png"
             ext = mimetypes.guess_extension(media_type) or (
                 ".mp4" if "video" in media_type else ".png")
             name = hashlib.sha256(raw).hexdigest()[:32] + ext
             os.makedirs(media_dir, exist_ok=True)
-            with open(os.path.join(media_dir, name), "wb") as f:
+            path = os.path.join(media_dir, name)
+            with open(path, "wb") as f:
                 f.write(raw)
+            if watermark.STRIP and is_video:
+                if not watermark.strip_video_watermark(path):
+                    log(f"[{job.profile}] video watermark removal skipped (file kept)")
             entry = {"media_type": media_type, "filename": name}
-            if job.type != "video":  # inline images as base64
+            if not is_video:  # inline images as base64
                 entry["b64"] = base64.b64encode(raw).decode("ascii")
             results.append(entry)
 
