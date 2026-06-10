@@ -15,7 +15,8 @@ class Job:
     id: str = field(default_factory=lambda: "job_" + uuid.uuid4().hex)
     created: float = 0.0            # set by engine (Date.now unavailable in some envs)
     profile: str = ""               # profile that handled it
-    status: str = "pending"         # pending|running|needs_verification|completed|failed
+    status: str = "pending"         # pending|running|needs_verification|wrong_account|completed|failed
+    tried_profiles: List[str] = field(default_factory=list)  # profiles re-routed away from
     results: List[Dict[str, Any]] = field(default_factory=list)
     text: str = ""
     error: str = ""

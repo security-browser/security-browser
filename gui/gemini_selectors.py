@@ -154,3 +154,31 @@ SIGNED_OUT_MARKERS = [
     "text=/Sign in/i",
     "text=/登录/",
 ]
+
+# ── Model selector (composer model dropdown, e.g. shows "Flash") ──────────────
+# The pill-shaped switcher at the bottom of the composer that shows the current
+# model name; clicking it opens a menu of models. best-effort.
+MODEL_SWITCHER = [
+    "bard-mode-switcher button",
+    "button[aria-label*='model' i]",
+    "button:has(.logo-pill-label-container)",
+    "button:has-text('Flash')",
+    "button:has-text('Pro')",
+]
+# Items in the opened model menu (matched further by visible text at runtime).
+MODEL_MENU_ITEM = [
+    "[role='menuitemradio']",
+    "[role='menuitem']",
+    "button.mat-mdc-menu-item",
+]
+
+# ── Active Google account indicator ───────────────────────────────────────────
+# The OneGoogle avatar button in the top-right; its aria-label usually embeds the
+# signed-in email, e.g. "Google Account: Name (foo@gmail.com)". best-effort —
+# refine with a dump if Google changes the OneGoogle bar.
+ACCOUNT_BUTTON = [
+    "a[aria-label*='Google Account' i]",
+    "a[aria-label*='Account' i][href*='SignOut']",
+    "a[href*='accounts.google.com/SignOutOptions']",
+    "[aria-label*='@gmail.com' i]",
+]

@@ -31,6 +31,11 @@ import watermark
 # (observed: a 64×64 placeholder appears before the full image renders).
 MIN_RESULT_PX = 256
 
+# Model to select in the composer before prompting (override via env). All jobs
+# use this; selection is best-effort and falls back to whatever is already set.
+# Pro tier = best quality (slower); Flash tier = faster, lower quality.
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "3.1 Pro")
+
 
 # ── low-level helpers ─────────────────────────────────────────────────────────
 
@@ -69,6 +74,53 @@ def detect_verification(page):
 
 def detect_signed_out(page):
     return any_present(page, S.SIGNED_OUT_MARKERS)
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def active_account_email(page):
+    """Best-effort read of the currently signed-in Google account email from the
+    OneGoogle avatar button's aria-label. Returns the email (lowercased) or None."""
+    sel = first_locator(page, S.ACCOUNT_BUTTON, timeout=5000)
+    if not sel:
+        return None
+    try:
+        label = page.locator(sel).first.get_attribute("aria-label") or ""
+    except Exception:
+        return None
+    m = _EMAIL_RE.search(label)
+    return m.group(0).lower() if m else None
+
+
+def verify_and_switch_account(page, expected, slot, log=print):
+    """Ensure the page is signed in as `expected` (a gmail). If a different account
+    is active, try switching via the /u/N account slots. Returns True if the
+    expected account is (now) active or verification isn't applicable; False if it
+    could not be reached (caller should re-route to another profile)."""
+    if not expected or "@" not in expected:
+        return True  # non-email profile name (e.g. "xiaolong") — nothing to verify
+    expected = expected.lower()
+    current = active_account_email(page)
+    if current is None:
+        log(f"[{expected}] could not read active account — proceeding without switch")
+        return True
+    if current == expected:
+        return True
+    log(f"[{expected}] active account is {current}, attempting to switch")
+    for n in range(6):
+        if n == slot and current is not None:
+            continue  # already saw this slot's account
+        try:
+            page.goto(S.APP_URL.format(slot=n), wait_until="domcontentloaded", timeout=60000)
+            first_locator(page, S.PROMPT_INPUT, timeout=15000)
+        except Exception:
+            continue
+        if active_account_email(page) == expected:
+            log(f"[{expected}] switched to account slot /u/{n}")
+            return True
+    log(f"[{expected}] expected account not found in slots /u/0../u/5")
+    return False
 
 
 def wait_until_cleared(page, job, log, poll=2.0, max_wait=600):
@@ -182,20 +234,93 @@ def attach_files(page, file_paths):
                        "(selectors may be stale — inspect with an open_upload dump)")
 
 
-def type_prompt_and_send(page, prompt):
+def _looks_like_video_prompt(prompt: str) -> bool:
+    """True if the prompt already asks for a video, so we don't double-prefix."""
+    p = (prompt or "").lower()
+    return any(k in p for k in ("视频", "影片", "动画", "video", "veo", "animate", "动态"))
+
+
+def select_model(page, model_name, log=print):
+    """Open the composer model dropdown and pick `model_name` (substring match,
+    best-effort). Leaves the current model if the switcher or option isn't found."""
+    if not model_name:
+        return
+    trig = first_locator(page, S.MODEL_SWITCHER, timeout=6000)
+    if not trig:
+        log(f"model switcher not found — keeping default model")
+        return
+    try:
+        page.locator(trig).first.click()
+        time.sleep(0.8)
+    except Exception:
+        return
+    for base in S.MODEL_MENU_ITEM:
+        try:
+            opt = page.locator(base).filter(has_text=model_name).first
+            if opt.count() > 0 and opt.is_visible():
+                opt.click()
+                time.sleep(0.5)
+                log(f"selected model: {model_name}")
+                return
+        except Exception:
+            continue
+    log(f"model '{model_name}' not in dropdown — keeping default")
+    try:
+        page.keyboard.press("Escape")  # close the menu so it doesn't block typing
+    except Exception:
+        pass
+
+
+def _composer_has_text(page, sel):
+    """True if the composer still holds typed text (i.e. it hasn't been sent)."""
+    try:
+        return bool((page.locator(sel).first.inner_text() or "").strip())
+    except Exception:
+        return False
+
+
+def _click_send(page):
+    """Trigger submit: click the send button if present, else press Enter."""
+    send = first_locator(page, S.SEND_BUTTON, timeout=4000)
+    if send:
+        try:
+            page.locator(send).first.click()
+            return
+        except Exception:
+            pass
+    page.keyboard.press("Enter")
+
+
+def type_prompt_and_send(page, prompt, log=print):
     sel = first_locator(page, S.PROMPT_INPUT, timeout=15000)
     if not sel:
         raise RuntimeError("prompt input not found")
     box = page.locator(sel).first
+    # Interface is up — let the composer fully settle before typing.
+    time.sleep(2.0)
     box.click()
-    box.fill(prompt)
-    time.sleep(0.3)
-    send = first_locator(page, S.SEND_BUTTON, timeout=8000)
-    if send:
-        page.locator(send).first.click()
-    else:
-        # Fallback: Enter submits in the Quill composer.
-        page.keyboard.press("Enter")
+    # Type with REAL key events instead of box.fill(): Gemini's Quill/Angular
+    # composer listens for input/beforeinput events to update its internal model.
+    # fill() writes the DOM text without firing those, so the model stays "empty"
+    # and the send button click becomes a no-op. Real keystrokes keep model/DOM
+    # in sync so submit works.
+    page.keyboard.type(prompt, delay=15)
+    time.sleep(1.0)
+    # Send, then VERIFY it actually left the composer; if the text is still there
+    # (e.g. an open menu swallowed the click, or the button only focused), re-focus
+    # and send again. The composer clears on a successful submit.
+    for attempt in range(4):
+        _click_send(page)
+        time.sleep(2.0)
+        if not _composer_has_text(page, sel):
+            return  # composer cleared → sent
+        log(f"prompt not sent yet (attempt {attempt + 1}) — retrying")
+        try:
+            box.click()  # re-focus (also dismisses a stray open menu)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    log("prompt still not sent after retries — leaving to the poll/timeout")
 
 
 def wait_for_generation_done(page, max_wait=600):
@@ -432,17 +557,37 @@ def run_job(page, job, media_dir, slot=0, log=print):
             return
 
         open_gemini(page, slot)
+        # A signed-out or wrong-account profile can't serve this job. For
+        # round-robin jobs we signal a re-route ("wrong_account") so the engine
+        # skips this profile and tries another; pinned jobs fail in requeue().
         if detect_signed_out(page):
-            raise RuntimeError("profile is signed out of Google")
+            job.status = "wrong_account"
+            job.error = "profile is signed out of Google"
+            return
+        # Confirm the active Google account is the expected one; switch slots if
+        # not. If the expected account can't be reached, re-route as above.
+        if not verify_and_switch_account(page, job.profile, slot, log):
+            job.status = "wrong_account"
+            job.error = f"active account != expected '{job.profile}'"
+            return
         if not wait_until_cleared(page, job, log):
             return  # left in needs_verification
+
+        # Pick the model before prompting (best-effort; keeps default if absent).
+        select_model(page, MODEL_NAME, log)
 
         in_files = _decode_inputs_to_files(job.input_media)
         if in_files:
             attach_files(page, in_files)
             time.sleep(1.0)
 
-        type_prompt_and_send(page, job.prompt)
+        # The composer has no explicit video tool wired in, so Gemini defaults to
+        # image generation. Prefix video jobs with an explicit instruction so the
+        # model routes the prompt to video (Veo) generation.
+        prompt = job.prompt
+        if job.type == "video" and not _looks_like_video_prompt(prompt):
+            prompt = "生成一段视频：" + prompt
+        type_prompt_and_send(page, prompt, log)
 
         # Poll for the result media to APPEAR (robust across locales/indicators),
         # pausing for any human-verification challenge that pops up mid-flight.

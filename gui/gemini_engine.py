@@ -124,12 +124,24 @@ class GeminiEngine:
         job.profile = entry["profile"]
         worker = self._ensure_ready(entry)
         if not worker:
+            # Unlaunchable account (e.g. no matching profile, or launch timed out).
+            # For round-robin jobs, skip it and re-route to another profile instead
+            # of failing; only a pinned account fails outright.
+            if not job.account:
+                self.requeue(job, entry["profile"])
+                return
             job.status = "failed"
             job.error = f"could not launch profile '{entry['profile']}'"
             return
+        worker.engine = self            # so the worker can re-route on wrong_account
         worker.gemini_slot = entry.get("slot", 0)
         worker.media_dir = MEDIA_DIR
         worker.submit_job(job)
+        # Optimistically mark busy NOW: the worker only flips state to "busy" once
+        # its thread dequeues the job, but the dispatcher may pick the next job
+        # before that happens — without this, back-to-back jobs all see this worker
+        # as idle and pile onto it instead of spreading to free accounts.
+        worker.state = "busy"
 
     def _select_entry(self, job: Job) -> Optional[Dict[str, Any]]:
         if job.account:
@@ -140,18 +152,58 @@ class GeminiEngine:
             return {"profile": job.account, "slot": 0, "enabled": True}
         if not self.pool:
             return None
-        # Prefer an already-running idle worker; else round-robin to the next.
+        # Route to a free account, never piling onto a busy one. Priority (each
+        # scanned round-robin from _rr, skipping profiles this job already tried):
+        #   1. a running idle worker  → reuse, no launch
+        #   2. a stopped account      → launch a fresh idle one
+        #   3. a busy/starting worker → queue behind it (only if all are busy)
+        exclude = set(job.tried_profiles)
         workers = getattr(self.mw, "workers", {})
         n = len(self.pool)
+        idle = stopped = busy = None
         for i in range(n):
             e = self.pool[(self._rr + i) % n]
+            if e["profile"] in exclude:
+                continue
             w = workers.get(e["profile"])
-            if w and getattr(w, "state", "") == "idle":
-                self._rr = (self._rr + i + 1) % n
-                return e
-        e = self.pool[self._rr % n]
-        self._rr = (self._rr + 1) % n
+            running = bool(w and w.isRunning())
+            state = getattr(w, "state", "stopped") if w else "stopped"
+            if running and state == "idle":
+                idle = (i, e)
+                break
+            if not running and stopped is None:
+                stopped = (i, e)
+            elif running and busy is None:   # busy or still starting
+                busy = (i, e)
+        chosen = idle or stopped or busy
+        if not chosen:
+            return None  # every account excluded (all tried)
+        i, e = chosen
+        self._rr = (self._rr + i + 1) % n
         return e
+
+    def requeue(self, job: Job, failed_profile: str):
+        """Re-dispatch a job whose profile couldn't serve it (signed out, wrong
+        Google account, or unlaunchable), excluding the offending profile. Pinned
+        jobs can't be honored elsewhere, and once every profile has been tried we
+        give up — both end as failed (keeping the last reason)."""
+        last_error = job.error or "profile unavailable"
+        if job.account:
+            job.status = "failed"
+            job.error = f"pinned account '{job.account}' unavailable: {last_error}"
+            return
+        if failed_profile and failed_profile not in job.tried_profiles:
+            job.tried_profiles.append(failed_profile)
+        if len(set(job.tried_profiles)) >= len(self.pool):
+            job.status = "failed"
+            job.error = f"no usable profile in the pool (last: {last_error})"
+            return
+        job.status = "pending"
+        job.profile = ""
+        job.error = ""
+        with self._cv:
+            self._incoming.append(job)
+            self._cv.notify()
 
     def _ensure_ready(self, entry: Dict[str, Any]):
         name = entry["profile"]
@@ -159,6 +211,12 @@ class GeminiEngine:
         w = workers.get(name)
         if w and getattr(w, "ready", False) and w.isRunning():
             return w
+        # Fast-fail if there is no such profile to launch — otherwise we would
+        # block the single dispatcher thread for the full LAUNCH_TIMEOUT.
+        known = {getattr(p, "name", None) for p in getattr(self.mw, "profiles", [])}
+        if known and name not in known:
+            print(f"[GeminiEngine] no profile named '{name}' — skipping")
+            return None
         # Ask the GUI thread to launch it (thread-safe signal).
         try:
             self.mw.request_launch.emit(name)

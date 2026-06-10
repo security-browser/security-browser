@@ -116,6 +116,7 @@ class CamoufoxWorker(QtCore.QThread):
         self.ready: bool = False              # True once the page is usable
         self.gemini_slot: int = 0             # Google account slot (/u/N)
         self.media_dir: str = "/tmp/gemini_media"
+        self.engine = None                    # set by GeminiEngine for re-routing
 
     def submit_job(self, job):
         """Enqueue an automation job; it runs on this worker's own thread."""
@@ -215,6 +216,14 @@ font-size:32px;font-weight:700;letter-spacing:2px;box-shadow:0 8px 32px rgba(0,0
                     job.error = f"{type(e).__name__}: {e}"
                 finally:
                     self.state = "idle"
+                # Wrong Google account on this profile → hand back to the engine
+                # to re-route to a different profile (see GeminiEngine.requeue).
+                if job.status == "wrong_account" and self.engine is not None:
+                    try:
+                        self.engine.requeue(job, self.profile.name)
+                    except Exception as e:
+                        job.status = "failed"
+                        job.error = f"requeue failed: {type(e).__name__}: {e}"
 
         except Exception as e:
             self.error.emit(f"Failed to start Camoufox: {e}")
