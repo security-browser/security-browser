@@ -72,6 +72,47 @@ def detect_verification(page):
     return any_present(page, S.VERIFICATION_MARKERS)
 
 
+def dismiss_blocking_dialogs(page, log=print, tries=4):
+    """Close any interstitial modal dialog (promo / ToS / feature announcement)
+    that overlays the composer and intercepts pointer events — the root cause of
+    'could not open a file chooser' when an upload click lands under the dialog.
+
+    Conservative: press Escape and click only non-committal controls (close ✕,
+    'No thanks', 'Not now', …); never an 'Accept'/'Continue' button. Returns True
+    if at least one dialog was dismissed. Logs the dialog text once for triage."""
+    dismissed = False
+    for _ in range(tries):
+        if not any_present(page, S.DIALOG_CONTAINER):
+            break
+        # Log what popped up (once per call) so unknown dialogs self-document.
+        if not dismissed:
+            try:
+                csel = first_locator(page, S.DIALOG_CONTAINER, timeout=500)
+                txt = (page.locator(csel).first.inner_text() or "").strip().replace("\n", " ")[:160] if csel else ""
+                log(f"blocking dialog detected, dismissing: {txt!r}")
+            except Exception:
+                pass
+        sel = first_locator(page, S.DIALOG_DISMISS, timeout=1500)
+        if sel:
+            try:
+                page.locator(sel).first.click(timeout=3000)
+                dismissed = True
+                time.sleep(0.5)
+                continue
+            except Exception:
+                pass
+        # Fallback: Escape (closes most non-critical mat-dialogs).
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+        except Exception:
+            pass
+        if not any_present(page, S.DIALOG_CONTAINER):
+            dismissed = True
+            break
+    return dismissed
+
+
 def detect_signed_out(page):
     return any_present(page, S.SIGNED_OUT_MARKERS)
 
@@ -208,6 +249,9 @@ def attach_files(page, file_paths):
 
     last_err = None
     for attempt in range(3):
+        # A blocking modal can appear at any time and intercept the menu click;
+        # clear it at the start of every attempt.
+        dismiss_blocking_dialogs(page)
         # A pre-existing hidden input is settable directly (rare).
         if _try_set_hidden_input(page, file_paths):
             return
@@ -510,6 +554,37 @@ def _fetch_inpage_bytes(page, url):
 
 # ── discovery helper ──────────────────────────────────────────────────────────
 
+def _probe_overlays(page):
+    """Walk every CDK overlay (popovers/menus) + the composer and return each
+    interactive node's identifying attributes, so the live upload selectors can
+    be read off without guessing from raw HTML. Also lists any file inputs."""
+    js = r"""
+    () => {
+      const ident = el => ({
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute('role'),
+        ariaLabel: el.getAttribute('aria-label') || el.getAttribute('arialabel'),
+        dataTestId: el.getAttribute('data-test-id'),
+        type: el.getAttribute('type'),
+        accept: el.getAttribute('accept'),
+        text: (el.innerText || el.textContent || '').trim().slice(0, 40),
+        cls: (el.className && el.className.toString ? el.className.toString() : '').slice(0, 80),
+      });
+      const SEL = 'button,[role],a,input,gem-icon-button,gem-nav-list-item,[data-test-id]';
+      const out = {overlays: [], fileInputs: [], composerControls: []};
+      document.querySelectorAll('.cdk-overlay-container *').forEach(el => {
+        if (el.matches(SEL)) out.overlays.push(ident(el));
+      });
+      document.querySelectorAll("input[type=file]").forEach(el => out.fileInputs.push(ident(el)));
+      const comp = document.querySelector('input-area-v2, input-container, .input-area');
+      if (comp) comp.querySelectorAll('button,gem-icon-button,[data-test-id]').forEach(
+        el => out.composerControls.push(ident(el)));
+      return out;
+    }
+    """
+    return page.evaluate(js)
+
+
 def dump_page(page, out_dir):
     """Save page HTML + screenshot for live selector discovery. Returns dict of
     written paths and which known anchors currently resolve."""
@@ -558,6 +633,13 @@ def run_job(page, job, media_dir, slot=0, log=print):
                         time.sleep(1.0)
                     except Exception as e:
                         log(f"[{job.profile}] dump: upload click failed: {e}")
+                # Enumerate every interactive node currently inside any cdk overlay
+                # (the popover the trigger opened) so the real upload selectors can
+                # be read off directly. Returned via job.text.
+                try:
+                    job.text = json.dumps(_probe_overlays(page), ensure_ascii=False)
+                except Exception as e:
+                    job.text = f"probe failed: {e}"
             job.results = [dump_page(page, media_dir)]
             job.status = "completed"
             return
@@ -578,6 +660,10 @@ def run_job(page, job, media_dir, slot=0, log=print):
             return
         if not wait_until_cleared(page, job, log):
             return  # left in needs_verification
+
+        # An interstitial promo/ToS dialog can sit on top of the composer and
+        # swallow every click (breaks upload + send). Clear it before interacting.
+        dismiss_blocking_dialogs(page, log)
 
         # Pick the model before prompting (best-effort; keeps default if absent).
         select_model(page, MODEL_NAME, log)

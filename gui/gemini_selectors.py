@@ -75,6 +75,35 @@ UPLOAD_MENU_ITEM = [
     "button:has-text('Upload files')",
 ]
 
+# ── Blocking modal dialogs ────────────────────────────────────────────────────
+# Gemini intermittently pops an interstitial modal (feature announcement, ToS/
+# policy update, "try X" promo). It renders in a cdk-global-overlay-wrapper on
+# TOP of the composer and STEALS pointer events, so any click (e.g. the upload
+# menu item) is intercepted and times out. We detect and dismiss it before/around
+# interactions. Dismissal is deliberately conservative — we only press Escape or
+# click clearly non-committal buttons (close ✕, "No thanks", "Not now", …); we
+# never click "Accept"/"Continue"-style buttons that might change account state.
+DIALOG_CONTAINER = [
+    "mat-dialog-container",
+    "div[role='dialog']",
+    ".cdk-global-overlay-wrapper [role='dialog']",
+    ".cdk-overlay-container mat-dialog-container",
+]
+DIALOG_DISMISS = [
+    "mat-dialog-container button[aria-label*='Close' i]",
+    "div[role='dialog'] button[aria-label*='Close' i]",
+    "mat-dialog-container button[aria-label*='Dismiss' i]",
+    "button:has(mat-icon[fonticon='close'])",
+    "mat-dialog-container button:has-text('No thanks')",
+    "mat-dialog-container button:has-text('Not now')",
+    "mat-dialog-container button:has-text('Maybe later')",
+    "mat-dialog-container button:has-text('Got it')",
+    "mat-dialog-container button:has-text('Dismiss')",
+    "mat-dialog-container button:has-text('Skip')",
+    "div[role='dialog'] button:has-text('No thanks')",
+    "div[role='dialog'] button:has-text('Got it')",
+]
+
 # ── Tool / mode toggles ───────────────────────────────────────────────────────
 # Some accounts must explicitly pick an image or video tool before prompting.
 # These are best-effort; if absent the plain prompt path is used.
