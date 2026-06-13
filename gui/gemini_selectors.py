@@ -62,8 +62,12 @@ UPLOAD_TRIGGER = [
     "button[aria-label*='添加']",
     "uploader button",
 ]
-# Menu item (inside the opened menu) that triggers the OS file chooser.
+# Menu item (inside the opened menu) that triggers the OS file chooser. Doubles as
+# the "menu is open" marker. CONFIRMED live: the "Upload files" list-item carries
+# data-test-id="local-images-files-uploader-button" and aria-label="Upload files…".
 UPLOAD_MENU_ITEM = [
+    "[data-test-id='local-images-files-uploader-button']",   # confirmed
+    "[role='menuitem'][aria-label*='Upload files' i]",       # confirmed
     "[role='menuitem']:has-text('Upload')",
     "[role='menuitem']:has-text('file')",
     "[role='menuitem']:has-text('photo')",

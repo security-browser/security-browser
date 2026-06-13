@@ -184,9 +184,11 @@ def _try_set_hidden_input(page, file_paths):
 def attach_files(page, file_paths):
     """Attach media via Gemini's '+' (Upload & tools) menu.
 
-    There is no <input type=file> in the DOM until the menu's upload item is
-    used, so: (1) try a pre-existing hidden input; (2) open the '+' menu and try
-    again; (3) click the upload menu item and capture the OS file chooser."""
+    There is no <input type=file> in the DOM, and the hidden file-selector trigger
+    buttons only exist while the '+' menu is OPEN — so we open the menu, confirm it
+    rendered (the "Upload files" item is present), then force-click a trigger to
+    capture the OS file chooser. The whole sequence is retried because the menu
+    sometimes needs a beat to render its triggers."""
     if not file_paths:
         return
 
@@ -204,34 +206,38 @@ def attach_files(page, file_paths):
                 continue
         return False
 
-    # Open the '+' (Upload & tools) menu first — this activates the hidden
-    # file-selector trigger buttons.
-    trig = first_locator(page, S.UPLOAD_TRIGGER, timeout=8000)
-    if trig:
-        try:
-            page.locator(trig).first.click()
-            time.sleep(0.8)
-        except Exception:
-            pass
-
-    # A real hidden input may now exist — settable without an OS dialog.
-    if _try_set_hidden_input(page, file_paths):
-        return
-    # Else force-click a hidden trigger and capture the file chooser it opens.
-    if _click_triggers_with_chooser():
-        return
-    # Last resort: a labelled menu item.
-    item = first_locator(page, S.UPLOAD_MENU_ITEM, timeout=4000)
-    if item:
-        try:
-            with page.expect_file_chooser(timeout=8000) as fc:
-                page.locator(item).first.click()
-            fc.value.set_files(file_paths)
+    last_err = None
+    for attempt in range(3):
+        # A pre-existing hidden input is settable directly (rare).
+        if _try_set_hidden_input(page, file_paths):
             return
-        except Exception:
-            pass
+        # Open the '+' menu and CONFIRM it rendered before touching the triggers.
+        trig = first_locator(page, S.UPLOAD_TRIGGER, timeout=8000)
+        if trig:
+            try:
+                page.locator(trig).first.click()
+            except Exception:
+                pass
+            first_locator(page, S.UPLOAD_MENU_ITEM, timeout=5000)  # menu is open
+            time.sleep(0.4)
+        if _try_set_hidden_input(page, file_paths):
+            return
+        # Force-click a hidden trigger and capture the OS file chooser it opens.
+        if _click_triggers_with_chooser():
+            return
+        # Fall back to clicking the labelled "Upload files" item.
+        item = first_locator(page, S.UPLOAD_MENU_ITEM, timeout=4000)
+        if item:
+            try:
+                with page.expect_file_chooser(timeout=8000) as fc:
+                    page.locator(item).first.click()
+                fc.value.set_files(file_paths)
+                return
+            except Exception as e:
+                last_err = e
+        time.sleep(1.0)  # let the UI settle, then retry the whole sequence
     raise RuntimeError("could not open a file chooser for upload "
-                       "(selectors may be stale — inspect with an open_upload dump)")
+                       f"(selectors may be stale — inspect with an open_upload dump; last: {last_err})")
 
 
 def _looks_like_video_prompt(prompt: str) -> bool:
