@@ -11,6 +11,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets, uic
 # ---- Camoufox (sync API) ----------------------------------------------------
 try:
     from camoufox.sync_api import Camoufox
+    try:
+        from camoufox import DefaultAddons  # bundled addons we can opt out of
+    except Exception:
+        DefaultAddons = None
     CAMOUFOX_OK = True
 except Exception:
     CAMOUFOX_OK = False
@@ -132,6 +136,11 @@ class CamoufoxWorker(QtCore.QThread):
                 "headless": False,  # GUI app; we use fullscreen instead
                 "window": (W + 2, H + 88),
             }
+
+            # Disable Camoufox's bundled uBlock Origin — its blocking can interfere
+            # with the Gemini UI (uploads, generated-media requests).
+            if DefaultAddons is not None:
+                opts["exclude_addons"] = [DefaultAddons.UBO]
 
             if self.profile.persistent_dir:
                 os.makedirs(self.profile.persistent_dir, exist_ok=True)
