@@ -360,6 +360,9 @@ def type_prompt_and_send(page, prompt, log=print):
     # (e.g. an open menu swallowed the click, or the button only focused), re-focus
     # and send again. The composer clears on a successful submit.
     for attempt in range(4):
+        # A modal that popped up after attach can intercept the send click; clear
+        # it before each attempt (no-op when nothing is showing).
+        dismiss_blocking_dialogs(page, log)
         _click_send(page)
         time.sleep(2.0)
         if not _composer_has_text(page, sel):
@@ -370,7 +373,10 @@ def type_prompt_and_send(page, prompt, log=print):
         except Exception:
             pass
         time.sleep(0.5)
-    log("prompt still not sent after retries — leaving to the poll/timeout")
+    # Fail FAST rather than letting run_job poll for a result that will never
+    # come (a never-sent prompt otherwise hangs the whole max_wait window).
+    raise RuntimeError("prompt could not be sent (composer never cleared — "
+                       "a blocking dialog or unresponsive send button)")
 
 
 def wait_for_generation_done(page, max_wait=600):
@@ -688,6 +694,16 @@ def run_job(page, job, media_dir, slot=0, log=print):
         deadline = time.monotonic() + max_wait
         items = []          # list of (raw_bytes, media_type)
         dl_errors = []
+        # Gemini sometimes answers with TEXT instead of media — e.g. a content
+        # refusal ("I can't create this kind of video"). The media then never
+        # appears, so without this we'd block the full max_wait and report a
+        # generic "no media" error. Detect a finished-but-media-less response and
+        # stop early, surfacing the response text as the error. We require the
+        # "done" state to hold for several consecutive checks so a slow video
+        # whose <video> mounts a beat after the spinner clears isn't misjudged.
+        text_only = False
+        done_no_media = 0
+        DONE_GRACE = 5
         time.sleep(2.0)
         while time.monotonic() < deadline:
             if detect_verification(page):
@@ -704,6 +720,15 @@ def run_job(page, job, media_dir, slot=0, log=print):
                 items = grab_images_via_canvas(page)
             if items:
                 break
+            # Generation finished (no "stop"/progress indicator) but still no
+            # media → almost certainly a text-only reply. Confirm it persists.
+            if not any_present(page, S.GENERATING_INDICATOR):
+                done_no_media += 1
+                if done_no_media >= DONE_GRACE:
+                    text_only = True
+                    break
+            else:
+                done_no_media = 0
             time.sleep(2.0)
 
         job.text = latest_response_text(page)
@@ -711,6 +736,14 @@ def run_job(page, job, media_dir, slot=0, log=print):
             if dl_errors:
                 job.status = "failed"
                 job.error = "downloads failed: " + " | ".join(dl_errors[:3])
+            elif text_only:
+                # Surface the model's own text as the error message.
+                msg = (job.text or "").strip()
+                kind = "video" if job.type == "video" else "image"
+                job.status = "failed"
+                job.error = (msg if msg
+                             else f"model returned text instead of {kind} (no media produced)")
+                log(f"[{getattr(job, 'profile', '?')}] text-only response: {job.error[:200]}")
             else:
                 try:
                     dump = dump_page(page, media_dir)
