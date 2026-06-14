@@ -391,6 +391,98 @@ def wait_for_generation_done(page, max_wait=600):
     return False
 
 
+# A turn that produced nothing still renders the model-response element with only
+# its screen-reader label ("Gemini said" / "You said"). Strip that label so an
+# empty reply collapses to "" and can be told apart from a real text answer.
+_RESPONSE_LABEL_RE = re.compile(
+    r"^\s*(gemini said|you said|gemini|bard said|bard)\s*[:：]?\s*", re.IGNORECASE)
+
+
+def _strip_response_label(text):
+    return _RESPONSE_LABEL_RE.sub("", (text or "").strip()).strip()
+
+
+def response_is_meaningful(text, min_len=12):
+    """True if the latest response holds real model content. Gemini shows an empty
+    'Gemini said' placeholder when a turn produced nothing (a send that didn't
+    register, or a silently dropped generation) — that must NOT be mistaken for a
+    genuine text reply such as a content refusal, or we'd surface a bogus error
+    instead of retrying."""
+    return len(_strip_response_label(text)) >= min_len
+
+
+def conversation_has_content(page, kind, settle=3.0, grace=8.0):
+    """After sending, wait `settle` seconds then check the conversation actually
+    has CONTENT — a progress indicator, result media, or a real (non-placeholder)
+    response. Returns False if nothing real shows up within `grace` seconds, which
+    means the send didn't register (the composer cleared but the request was
+    dropped) or the turn produced only the empty 'Gemini said' placeholder — in
+    both cases the caller should re-send rather than wait out the whole window.
+
+    A couple of extra polls past `settle` keep a real video that is slightly slow
+    to mount its progress spinner from being re-sent needlessly."""
+    time.sleep(settle)
+    deadline = time.monotonic() + max(0.0, grace - settle)
+    while True:
+        if any_present(page, S.GENERATING_INDICATOR):
+            return True
+        try:
+            if collect_result_urls(page, kind):
+                return True
+        except Exception:
+            pass
+        if response_is_meaningful(latest_response_text(page)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(1.0)
+
+
+def _collect_media(page, job, media_dir, max_wait, log):
+    """Poll the latest response until result media appears, or it's clearly a
+    media-less reply. Returns (items, dl_errors, text_only). On an unsolved human
+    verification it sets job.status='needs_verification' and returns early."""
+    deadline = time.monotonic() + max_wait
+    items = []          # list of (raw_bytes, media_type)
+    dl_errors = []
+    # Gemini sometimes answers with TEXT instead of media — e.g. a content refusal
+    # ("I can't create this kind of video"). The media then never appears, so
+    # without this we'd block the full window. Detect a finished-but-media-less
+    # response and stop early. We require the "done" state to hold for several
+    # consecutive checks so a slow video whose <video> mounts a beat after the
+    # spinner clears isn't misjudged.
+    text_only = False
+    done_no_media = 0
+    DONE_GRACE = 5
+    time.sleep(2.0)
+    while time.monotonic() < deadline:
+        if detect_verification(page):
+            if not wait_until_cleared(page, job, log):
+                return items, dl_errors, text_only
+        if job.type == "video":
+            for url in collect_result_urls(page, "video"):
+                try:
+                    _, mt, raw = download_media(page, url, media_dir)
+                    items.append((raw, mt))
+                except Exception as e:
+                    dl_errors.append(f"{url[:70]} -> {type(e).__name__}: {e}")
+        else:
+            items = grab_images_via_canvas(page)
+        if items:
+            break
+        # Generation finished (no "stop"/progress indicator) but still no media →
+        # almost certainly a text-only reply. Confirm it persists.
+        if not any_present(page, S.GENERATING_INDICATOR):
+            done_no_media += 1
+            if done_no_media >= DONE_GRACE:
+                text_only = True
+                break
+        else:
+            done_no_media = 0
+        time.sleep(2.0)
+    return items, dl_errors, text_only
+
+
 def _upgrade_gusercontent(src):
     """Rewrite a googleusercontent thumbnail URL to full resolution by bumping
     its size token (=s64 / =w64-h64 / =s512-c → large)."""
@@ -685,64 +777,62 @@ def run_job(page, job, media_dir, slot=0, log=print):
         prompt = job.prompt
         if job.type == "video" and not _looks_like_video_prompt(prompt):
             prompt = "生成一段视频：" + prompt
-        type_prompt_and_send(page, prompt, log)
 
-        # Poll for the result media to APPEAR (robust across locales/indicators),
-        # pausing for any human-verification challenge that pops up mid-flight.
-        # Images are read off the canvas (handles blob: srcs); videos by URL.
+        # Send, then SELF-CHECK that the conversation actually got content, re-
+        # sending on the two silent failures that both look like "nothing came
+        # out": (1) the send clears the composer but the request never registers,
+        # so Gemini shows only the empty "Gemini said" placeholder; (2) a turn
+        # starts but yields neither media nor a real reply. Per the agreed rule:
+        # after each send wait ~3s, check the conversation has content, re-send if
+        # not, up to SEND_ATTEMPTS times, then fail. A MEANINGFUL text reply (e.g.
+        # a content refusal) is a real answer — we stop and surface it.
         max_wait = 900 if job.type == "video" else 300
-        deadline = time.monotonic() + max_wait
-        items = []          # list of (raw_bytes, media_type)
-        dl_errors = []
-        # Gemini sometimes answers with TEXT instead of media — e.g. a content
-        # refusal ("I can't create this kind of video"). The media then never
-        # appears, so without this we'd block the full max_wait and report a
-        # generic "no media" error. Detect a finished-but-media-less response and
-        # stop early, surfacing the response text as the error. We require the
-        # "done" state to hold for several consecutive checks so a slow video
-        # whose <video> mounts a beat after the spinner clears isn't misjudged.
-        text_only = False
-        done_no_media = 0
-        DONE_GRACE = 5
-        time.sleep(2.0)
-        while time.monotonic() < deadline:
-            if detect_verification(page):
-                if not wait_until_cleared(page, job, log):
-                    return
-            if job.type == "video":
-                for url in collect_result_urls(page, "video"):
-                    try:
-                        _, mt, raw = download_media(page, url, media_dir)
-                        items.append((raw, mt))
-                    except Exception as e:
-                        dl_errors.append(f"{url[:70]} -> {type(e).__name__}: {e}")
-            else:
-                items = grab_images_via_canvas(page)
-            if items:
+        kind = "video" if job.type == "video" else "image"
+        SEND_ATTEMPTS = 3
+        items, dl_errors, text_only = [], [], False
+        had_content = False
+        for attempt in range(SEND_ATTEMPTS):
+            type_prompt_and_send(page, prompt, log)
+            # Wait ~3s and confirm the conversation actually has content; if not,
+            # the prompt didn't take → re-send instead of blocking the full window.
+            if not conversation_has_content(page, kind):
+                log(f"[{job.profile}] no content after send "
+                    f"(attempt {attempt + 1}/{SEND_ATTEMPTS}) — re-sending")
+                continue
+            had_content = True
+            # Poll for result media (images off the canvas, videos by URL),
+            # pausing for any human-verification challenge mid-flight.
+            items, dl_errors, text_only = _collect_media(page, job, media_dir, max_wait, log)
+            if job.status == "needs_verification":
+                return  # left for a human to solve in the visible window
+            if items or dl_errors:
                 break
-            # Generation finished (no "stop"/progress indicator) but still no
-            # media → almost certainly a text-only reply. Confirm it persists.
-            if not any_present(page, S.GENERATING_INDICATOR):
-                done_no_media += 1
-                if done_no_media >= DONE_GRACE:
-                    text_only = True
-                    break
-            else:
-                done_no_media = 0
-            time.sleep(2.0)
+            job.text = latest_response_text(page)
+            # Finished but no media: an empty placeholder means the generation
+            # silently no-op'd → re-send; a meaningful reply is terminal.
+            if not response_is_meaningful(job.text):
+                had_content = False
+                log(f"[{job.profile}] empty response, no media "
+                    f"(attempt {attempt + 1}/{SEND_ATTEMPTS}) — re-sending")
+                continue
+            break
 
         job.text = latest_response_text(page)
         if not items:
             if dl_errors:
                 job.status = "failed"
                 job.error = "downloads failed: " + " | ".join(dl_errors[:3])
-            elif text_only:
-                # Surface the model's own text as the error message.
-                msg = (job.text or "").strip()
-                kind = "video" if job.type == "video" else "image"
+            elif not had_content:
+                # Every attempt produced no real content — the prompt never yielded
+                # a response (dropped send, or a persistently empty/blocked reply).
                 job.status = "failed"
-                job.error = (msg if msg
-                             else f"model returned text instead of {kind} (no media produced)")
+                job.error = (f"no content after {SEND_ATTEMPTS} attempts — the prompt "
+                             "produced no response (not submitted, or empty/blocked reply)")
+                log(f"[{getattr(job, 'profile', '?')}] {job.error}")
+            elif text_only and response_is_meaningful(job.text):
+                # A real text reply (refusal/explanation) — surface the model's text.
+                job.status = "failed"
+                job.error = job.text.strip()
                 log(f"[{getattr(job, 'profile', '?')}] text-only response: {job.error[:200]}")
             else:
                 try:
